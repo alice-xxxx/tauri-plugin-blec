@@ -64,9 +64,11 @@ impl BleDevice {
         #[cfg(not(target_vendor = "apple"))]
         let address = peripheral.address().to_string();
         let properties = peripheral.properties().await?.unwrap_or_default();
-        let name = properties
-            .local_name
-            .unwrap_or_else(|| peripheral.id().to_string());
+        let name = [properties.local_name, properties.advertisement_name]
+            .into_iter()
+            .flatten()
+            .find(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| address.clone());
         Ok(Self {
             address,
             name,

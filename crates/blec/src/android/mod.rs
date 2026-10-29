@@ -99,8 +99,26 @@ static SCAN_TASK: Lazy<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
     Lazy::new(|| std::sync::Mutex::new(None));
 
 #[derive(serde::Deserialize)]
-struct PeripheralResult {
-    result: Peripheral,
+struct PeripheralResult<T = Peripheral> {
+    result: T,
+}
+
+impl Adapter {
+    pub(crate) async fn connected_peripherals(&self) -> Result<Vec<Peripheral>> {
+        let response: PeripheralResult<Vec<Peripheral>> = bridge::call(
+            "connected_peripherals",
+            serde_json::Value::Null,
+            IPC_DEFAULT_TIMEOUT,
+        )
+        .await
+        .map_err(ble_err)?;
+        let mut devices = DEVICES.write().await;
+        Ok(response
+            .result
+            .into_iter()
+            .map(|peripheral| peripheral.register(&mut devices))
+            .collect())
+    }
 }
 
 #[allow(dependency_on_unit_never_type_fallback)]
@@ -183,7 +201,7 @@ impl btleplug::api::Central for Adapter {
         DEVICES.write().await.clear();
         let task = tokio::spawn(async move {
             while let Some(value) = rx.next().await {
-                let device = match serde_json::from_value::<PeripheralResult>(value) {
+                let mut device = match serde_json::from_value::<PeripheralResult>(value) {
                     Ok(PeripheralResult { result }) => result,
                     Err(e) => {
                         tracing::error!("failed to deserialize peripheral: {e}");
@@ -191,7 +209,13 @@ impl btleplug::api::Central for Adapter {
                     }
                 };
                 tracing::trace!("device: {device:?}");
-                DEVICES.write().await.insert(device.id.clone(), device);
+                let mut devices = DEVICES.write().await;
+                if device.name.trim().is_empty() {
+                    if let Some(known) = devices.get(&device.id) {
+                        device.name.clone_from(&known.name);
+                    }
+                }
+                devices.insert(device.id.clone(), device);
             }
         });
         // A scan that is still running keeps its own channel registered; replace
@@ -257,11 +281,7 @@ impl btleplug::api::Central for Adapter {
             // about advertisements, so an entry a scan already filled in is
             // kept: the point of the call is repairing the java device map.
             let mut devices = DEVICES.write().await;
-            let peripheral = devices
-                .entry(res.result.id.clone())
-                .or_insert(res.result)
-                .clone();
-            peripherals.push(peripheral);
+            peripherals.push(res.result.register(&mut devices));
         }
         Ok(peripherals)
     }
@@ -357,7 +377,7 @@ pub struct Peripheral {
     id: PeripheralId,
     address: BDAddr,
     name: String,
-    rssi: i16,
+    rssi: Option<i16>,
     #[serde(default = "default_mtu")]
     mtu_val: AtomicU16,
     #[serde(default, deserialize_with = "deserialize_base64_map")]
@@ -371,6 +391,22 @@ pub struct Peripheral {
 fn default_mtu() -> AtomicU16 {
     AtomicU16::new(23)
 }
+
+impl Peripheral {
+    // Keep advertisement data and negotiated MTU when registering a system device.
+    fn register(self, devices: &mut HashMap<PeripheralId, Self>) -> Self {
+        devices
+            .entry(self.id.clone())
+            .and_modify(|known| {
+                if known.name.trim().is_empty() {
+                    known.name.clone_from(&self.name);
+                }
+            })
+            .or_insert(self)
+            .clone()
+    }
+}
+
 impl Clone for Peripheral {
     fn clone(&self) -> Self {
         Self {
@@ -459,7 +495,7 @@ impl btleplug::api::Peripheral for Peripheral {
             address: self.address,
             local_name: Some(self.name.clone()),
             advertisement_name: Some(self.name.clone()),
-            rssi: Some(self.rssi),
+            rssi: self.rssi,
             manufacturer_data: self.manufacturer_data.clone(),
             service_data: self.service_data.clone(),
             services: self.services.clone(),

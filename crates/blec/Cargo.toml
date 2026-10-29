@@ -41,6 +41,9 @@ ndk-context = "0.1"
 # The kotlin side sends characteristic values as base64.
 base64.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Devices_Bluetooth", "Devices_Enumeration", "Foundation"] }
+
 [features]
 # Replaces the platform BLE backend with an in-process mock (see `blec::mock`).
 # Meant for tests and for running an app without Bluetooth hardware. Desktop targets only.

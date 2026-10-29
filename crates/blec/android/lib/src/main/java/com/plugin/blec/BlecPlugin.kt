@@ -60,6 +60,10 @@ class BlecPlugin(private val context: Context) {
             "start_scan" -> startScan(invoke)
             "stop_scan" -> client.stopScan(invoke)
             "retrieve_peripheral" -> retrievePeripheral(invoke)
+            "connected_peripherals" -> {
+                if (hasBTPermissions()) client.connectedPeripherals(invoke)
+                else invoke.reject("connected_peripherals: Missing bluetooth permission!")
+            }
             "events" -> events(invoke)
             "adapter_state" -> client.adapterState(invoke)
             "check_permissions" -> checkPermissions(invoke)

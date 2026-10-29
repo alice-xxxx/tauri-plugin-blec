@@ -35,6 +35,27 @@ mod tests;
 /// is not in the device index yet. It returns as soon as the address shows up.
 const ADDRESS_SCAN_MS: u64 = 5000;
 
+#[cfg(all(target_os = "windows", not(any(test, feature = "mock"))))]
+async fn system_device_name(address: btleplug::api::BDAddr) -> Option<String> {
+    use std::future::IntoFuture;
+    use windows::Devices::Bluetooth::BluetoothLEDevice;
+
+    let device = BluetoothLEDevice::FromBluetoothAddressAsync(address.into())
+        .ok()?
+        .into_future()
+        .await
+        .ok()?;
+    let name = device
+        .DeviceInformation()
+        .and_then(|info| info.Name())
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| device.Name().ok().filter(|name| !name.is_empty()))
+        .map(|name| name.to_string());
+    let _ = device.Close();
+    name
+}
+
 struct Listener {
     uuid: Uuid,
     service: Uuid,
@@ -110,7 +131,7 @@ struct HandlerState {
 }
 
 pub struct Handler {
-    devices: Arc<Mutex<HashMap<String, Peripheral>>>,
+    devices: Mutex<HashMap<String, Peripheral>>,
     adapter: Mutex<Option<Arc<Adapter>>>,
     /// Task forwarding the adapter's `CentralEvent`s to `handle_event`
     event_pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -268,7 +289,7 @@ impl Handler {
 
     fn with_adapter(adapter: Option<Arc<Adapter>>) -> Self {
         Self {
-            devices: Arc::new(Mutex::new(HashMap::new())),
+            devices: Mutex::new(HashMap::new()),
             adapter: Mutex::new(adapter),
             event_pump: Mutex::new(None),
             links: std::sync::Mutex::new(HashMap::new()),
@@ -737,7 +758,8 @@ impl Handler {
             link.peripheral = device.clone();
             (link.connected.subscribe(), link.gatt_lock.clone())
         };
-        if device.is_connected().await? {
+        let locally_connected = *connected_rx.borrow();
+        if locally_connected && device.is_connected().await? {
             debug!("Device already connected");
             self.set_link_connected(address, device);
             return Ok(());
@@ -968,6 +990,8 @@ impl Handler {
                 let _ = adapter.stop_scan().await;
             }
             // start a new scan
+            // Clear before returning, so a concurrent system-device lookup is not erased.
+            self.devices.lock().await.clear();
             ALLOW_IBEACONS.store(allow_ibeacons, std::sync::atomic::Ordering::Release);
             adapter
                 .start_scan(btleplug::api::ScanFilter::default())
@@ -975,10 +999,8 @@ impl Handler {
         }
         self.send_scan_update(true).await;
         let mut state = self.state.lock().await;
-        let mut self_devices = self.devices.clone();
         let adapter = adapter.clone();
         state.scan_task = Some(tokio::task::spawn(async move {
-            self_devices.lock().await.clear();
             let loops = std::cmp::max(1, timeout / 200);
             let mut devices;
             for _ in 0..loops {
@@ -988,7 +1010,7 @@ impl Handler {
                     .await
                     .expect("failed to get peripherals");
                 filter_peripherals(&mut discovered, &filter).await;
-                devices = Self::add_devices(&mut self_devices, discovered).await;
+                devices = self.add_devices(discovered).await;
                 if !devices.is_empty() {
                     if let Some(tx) = &tx {
                         tx.send(devices.clone())
@@ -1100,15 +1122,12 @@ impl Handler {
         Ok(())
     }
 
-    async fn add_devices(
-        self_devices: &mut Arc<Mutex<HashMap<String, Peripheral>>>,
-        discovered: Vec<Peripheral>,
-    ) -> Vec<BleDevice> {
+    async fn add_devices(&self, discovered: Vec<Peripheral>) -> Vec<BleDevice> {
         let mut devices = vec![];
         for p in discovered {
             match BleDevice::from_peripheral(&p).await {
                 Ok(dev) => {
-                    self_devices.lock().await.insert(dev.address.clone(), p);
+                    self.devices.lock().await.insert(dev.address.clone(), p);
                     devices.push(dev);
                 }
                 Err(e) => {
@@ -1386,6 +1405,43 @@ impl Handler {
         }
         devices.sort();
         devices
+    }
+
+    /// Finds system-connected peripherals and registers them for `connect`,
+    /// without opening a local connection. Android returns all connected GATT
+    /// candidates; the other backends select by service.
+    pub async fn system_connected_devices(
+        &'static self,
+        service: Uuid,
+    ) -> Result<Vec<BleDevice>, Error> {
+        let adapter = self.get_or_init_adapter().await?;
+        #[cfg(all(target_os = "android", not(any(test, feature = "mock"))))]
+        let peripherals = {
+            let _ = service;
+            adapter.connected_peripherals().await?
+        };
+        #[cfg(not(all(target_os = "android", not(any(test, feature = "mock")))))]
+        let peripherals = adapter
+            .retrieve_peripherals(RetrievePeripheralsOptions {
+                identifiers: None,
+                services: Some(vec![service]),
+            })
+            .await?;
+        let devices = self.add_devices(peripherals).await;
+        #[cfg(all(target_os = "windows", not(any(test, feature = "mock"))))]
+        let devices = futures::future::join_all(devices.into_iter().map(|mut device| async move {
+            // No advertisement-backed name: read the system cache without connecting.
+            if device.name.eq_ignore_ascii_case(&device.address) {
+                if let Ok(address) = device.address.parse() {
+                    if let Some(name) = system_device_name(address).await {
+                        device.name = name;
+                    }
+                }
+            }
+            device
+        }))
+        .await;
+        Ok(devices)
     }
 
     /// A [`Connection`] to the device with this address, for a device that

@@ -147,17 +147,7 @@ class BleClient(private val context: Context, private val plugin: BlecPlugin) {
 
         scanCb = object: ScanCallback(){
             private fun sendResult(result: ScanResult){
-                var name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    result.device.alias
-                } else {
-                    result.device.name
-                }
-                if (name==null){
-                    name = result.scanRecord?.deviceName
-                }
-                if (name == null) {
-                    name = ""
-                }
+                val name = deviceName(result.device) ?: result.scanRecord?.deviceName.orEmpty()
                 val connected = this@BleClient.manager!!.getConnectionState(result.device,BluetoothProfile.GATT_SERVER) == BluetoothProfile.STATE_CONNECTED
                 val bonded = result.device.getBondState() == BluetoothDevice.BOND_BONDED
                 val txPower = if (result.txPower == TX_POWER_NOT_PRESENT) {
@@ -239,28 +229,42 @@ class BleClient(private val context: Context, private val plugin: BlecPlugin) {
             invoke.reject("retrieve_peripheral: '${args.address}' is not a bluetooth address")
             return
         }
-        val existing = this.plugin.connected_devices[args.address]
-            ?: this.plugin.devices[args.address]
-        this.plugin.devices[args.address] = existing
+        invoke.resolve(JSONObject().put("result", registerPeripheral(remote)))
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connectedPeripherals(invoke: Invoke) {
+        manager = context.getSystemService(BluetoothManager::class.java)
+        val manager = manager
+        if (manager == null) {
+            invoke.reject("connected_peripherals: no bluetooth manager available")
+            return
+        }
+        val devices = manager.getConnectedDevices(BluetoothProfile.GATT).map(::registerPeripheral)
+        invoke.resolve(JSONObject().put("result", JSONArray(devices)))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun deviceName(remote: BluetoothDevice): String? =
+        (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) remote.alias else null)
+            ?.takeIf { it.isNotBlank() }
+            ?: remote.name?.takeIf { it.isNotBlank() }
+
+    @SuppressLint("MissingPermission")
+    private fun registerPeripheral(remote: BluetoothDevice): JSONObject {
+        val existing = this.plugin.connected_devices[remote.address]
+            ?: this.plugin.devices[remote.address]
+        this.plugin.devices[remote.address] = existing
             ?: Peripheral(this.context, remote, this.plugin)
 
-        var name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            remote.alias
-        } else {
-            remote.name
-        }
-        if (name == null) {
-            name = ""
-        }
-        val connected = manager!!.getConnectionState(remote, BluetoothProfile.GATT_SERVER) ==
+        val name = deviceName(remote).orEmpty()
+        val connected = manager!!.getConnectionState(remote, BluetoothProfile.GATT) ==
             BluetoothProfile.STATE_CONNECTED
         val bonded = remote.getBondState() == BluetoothDevice.BOND_BONDED
         // No advertisement was received, so there is no rssi, manufacturer or
         // service data to report.
         val device = BleDevice(remote.address, name, 0, connected, bonded, null, null, null, null)
-        val res = JSONObject()
-        res.put("result", device.toJsObject())
-        invoke.resolve(res)
+        return device.toJsObject().put("rssi", JSONObject.NULL)
     }
 
     fun adapterState(invoke: Invoke) {
