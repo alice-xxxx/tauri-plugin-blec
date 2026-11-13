@@ -1,6 +1,6 @@
 [package]
 name = "blec"
-version = "0.18.0" # x-release-please-version
+version = "0.20.0" # x-release-please-version
 description = "Cross platform BLE client for rust, with an android backend for Tauri, Dioxus and custom hosts"
 readme = "README.md"
 # A host builds `android/lib` and nothing else; the standalone gradle project
@@ -26,7 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 btleplug.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid.workspace = true
 once_cell.workspace = true
 tracing.workspace = true
@@ -56,11 +56,11 @@ embedded-dex = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+futures-lite = "2"
 rand = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [package.metadata.docs.rs]
-rustc-args = ["--cfg", "docsrs"]
 rustdoc-args = ["--cfg", "docsrs"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = [

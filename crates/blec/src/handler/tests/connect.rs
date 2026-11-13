@@ -27,7 +27,7 @@ async fn connect_happy_path() {
 
     // characteristics of every service are usable
     handler
-        .send_data(CHARAC, None, &[1, 2, 3], WriteType::WithResponse)
+        .send_data(CHARAC, Some(SERVICE), &[1, 2, 3], WriteType::WithResponse)
         .await
         .unwrap();
     handler
@@ -157,6 +157,230 @@ async fn connect_unknown_address_fails_cleanly() {
     );
     assert_disconnected(handler).await;
     assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+/// A device that does not advertise (Windows still holds its old link, or it
+/// only talks to bonded centrals) is never found by the scan. A backend that
+/// can make a peripheral from the address (WinRT's `add_peripheral`) reaches it
+/// anyway once the scan is over.
+#[tokio::test(start_paused = true)]
+async fn connect_by_address_when_the_scan_does_not_see_the_device() {
+    let (world, handler) = test_world();
+    world.set_add_peripheral_supported(true);
+    let device = stress_device(&world);
+    device.set_advertising(false);
+
+    let start = tokio::time::Instant::now();
+    let (on_disconnect, counter) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("connect by address");
+    assert!(
+        start.elapsed() >= Duration::from_secs(5),
+        "connected before the scan was over: {:?}",
+        start.elapsed()
+    );
+    assert!(handler.is_connected());
+    assert!(device.is_connected());
+    assert!(!handler.is_scanning().await, "scan left running");
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+    // the device index keeps the peripheral, so a reconnect needs no scan
+    handler.disconnect().await.expect("disconnect failed");
+    settle().await;
+    let start = tokio::time::Instant::now();
+    let (on_disconnect, _) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("reconnect by address");
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "reconnect scanned again: {:?}",
+        start.elapsed()
+    );
+    assert!(device.is_connected());
+}
+
+/// Without `add_peripheral` (BlueZ, CoreBluetooth, android) a device the scan
+/// does not see stays unknown, and nothing is tried on it.
+#[tokio::test(start_paused = true)]
+async fn connect_to_a_silent_device_fails_without_add_peripheral() {
+    let (world, handler) = test_world();
+    let device = stress_device(&world);
+    device.set_advertising(false);
+
+    let (on_disconnect, counter) = disconnect_counter();
+    let result = handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await;
+    assert!(
+        matches!(result, Err(Error::UnknownPeripheral(_))),
+        "{result:?}"
+    );
+    assert_eq!(device.count_ops(&Op::Connect), 0);
+    assert!(!handler.is_scanning().await, "scan left running");
+    assert_disconnected(handler).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+/// With `add_peripheral`, an address no device has still fails cleanly: the
+/// mock refuses to add it, WinRT adds it and the connect fails (modelled by a
+/// device out of range). Either way no link is left and the disconnect
+/// callback does not run.
+#[tokio::test(start_paused = true)]
+async fn connect_by_address_to_a_missing_device_fails_cleanly() {
+    let (world, handler) = test_world();
+    world.set_add_peripheral_supported(true);
+    let _other = other_device(&world);
+
+    let (on_disconnect, counter) = disconnect_counter();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        handler.connect("11:22:33:44:55:66", on_disconnect, false),
+    )
+    .await
+    .expect("connect did not return");
+    assert!(
+        matches!(result, Err(Error::UnknownPeripheral(_))),
+        "{result:?}"
+    );
+    assert!(!handler.is_scanning().await, "scan left running");
+    assert_disconnected(handler).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+    let device = stress_device(&world);
+    device.set_in_range(false);
+    let (on_disconnect, counter) = disconnect_counter();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        handler.connect(&device.address_string(), on_disconnect, false),
+    )
+    .await
+    .expect("connect did not return");
+    assert!(matches!(result, Err(Error::Btleplug(_))), "{result:?}");
+    assert_eq!(device.count_ops(&Op::Connect), 3);
+    assert!(!device.is_connected());
+    assert_disconnected(handler).await;
+    settle().await;
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+/// BlueZ removes an unpaired device it has not seen for a few minutes and only
+/// brings it back while discovery runs. The device index still has the
+/// address, so nothing scanned and every connect failed on the stale handle
+/// ("Method GetAll ... doesn't exist"). The connect has to notice, scan for the
+/// address again and go on with the peripheral that scan found.
+#[tokio::test(start_paused = true)]
+async fn stale_known_device_reconnects_via_a_rescan() {
+    let (world, handler) = test_world();
+    let device = stress_device(&world);
+
+    scan(handler, ScanFilter::None).await.expect("scan failed");
+    device.expire();
+    let scans = world.scan_starts();
+
+    let start = tokio::time::Instant::now();
+    let (on_disconnect, _) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("connect to a device the backend dropped");
+    assert!(handler.is_connected());
+    assert!(device.is_connected());
+    assert_eq!(
+        device.ops(),
+        vec![Op::Connect, Op::Connect, Op::DiscoverServices],
+        "one failed connect on the stale handle, one on the fresh one"
+    );
+    assert_eq!(world.scan_starts(), scans + 1, "exactly one rescan");
+    assert!(!handler.is_scanning().await, "scan left running");
+    assert!(!world.is_scanning(), "adapter left scanning");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "the rescan did not end when the device showed up: {:?}",
+        start.elapsed()
+    );
+}
+
+/// The same stale device, but it is gone for real: the rescan does not find
+/// it, and the connect ends with `UnknownPeripheral` instead of trying the
+/// stale handle again or hanging. Once it is back, the next connect scans for
+/// it right away, because the index forgot the address.
+#[tokio::test(start_paused = true)]
+async fn stale_and_gone_device_fails_cleanly() {
+    let (world, handler) = test_world();
+    let device = stress_device(&world);
+    let mut events = connection_events(handler).await;
+
+    scan(handler, ScanFilter::None).await.expect("scan failed");
+    device.expire();
+    device.set_in_range(false);
+    let scans = world.scan_starts();
+
+    let start = tokio::time::Instant::now();
+    let (on_disconnect, counter) = disconnect_counter();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        handler.connect(&device.address_string(), on_disconnect, false),
+    )
+    .await
+    .expect("connect did not return");
+    assert!(
+        matches!(result, Err(Error::UnknownPeripheral(_))),
+        "{result:?}"
+    );
+    assert_eq!(device.count_ops(&Op::Connect), 1, "{:?}", device.ops());
+    assert_eq!(world.scan_starts(), scans + 1, "exactly one rescan");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert!(!handler.is_scanning().await, "scan left running");
+    assert!(!world.is_scanning(), "adapter left scanning");
+    assert_disconnected(handler).await;
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+    assert_eq!(drain(&mut events), vec![update(&device, false)]);
+
+    device.set_in_range(true);
+    let (on_disconnect, _) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("connect once the device is back");
+    assert!(device.is_connected());
+}
+
+/// A device the index and the backend both know connects without any scan,
+/// also when a connect has to be retried: the rescan is only for a device the
+/// backend has nothing for.
+#[tokio::test(start_paused = true)]
+async fn known_device_connects_without_a_scan() {
+    let (world, handler) = test_world();
+    let device = stress_device(&world);
+
+    scan(handler, ScanFilter::None).await.expect("scan failed");
+    let scans = world.scan_starts();
+
+    let (on_disconnect, _) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("connect failed");
+    assert_eq!(device.ops(), vec![Op::Connect, Op::DiscoverServices]);
+    handler.disconnect().await.expect("disconnect failed");
+    settle().await;
+
+    device.fail_next_connects(2, FailKind::TimedOut);
+    let (on_disconnect, _) = disconnect_counter();
+    handler
+        .connect(&device.address_string(), on_disconnect, false)
+        .await
+        .expect("connect after two failures");
+    assert!(device.is_connected());
+    assert_eq!(world.scan_starts(), scans, "a known device was scanned for");
 }
 
 #[tokio::test(start_paused = true)]
@@ -395,27 +619,27 @@ async fn write_and_read_errors_are_reported() {
     device.set_write_behaviour(OpBehaviour::Fail(FailKind::NotConnected));
     assert!(matches!(
         handler
-            .send_data(CHARAC, None, &[1], WriteType::WithResponse)
+            .send_data(CHARAC, Some(SERVICE), &[1], WriteType::WithResponse)
             .await,
         Err(Error::Btleplug(_))
     ));
     device.set_write_behaviour(OpBehaviour::Hang);
     assert!(matches!(
         handler
-            .send_data(CHARAC, None, &[1], WriteType::WithResponse)
+            .send_data(CHARAC, Some(SERVICE), &[1], WriteType::WithResponse)
             .await,
         Err(Error::Timeout(_))
     ));
     device.set_read_behaviour(OpBehaviour::Hang);
     assert!(matches!(
-        handler.recv_data(CHARAC, None).await,
+        handler.recv_data(CHARAC, Some(SERVICE)).await,
         Err(Error::Timeout(_))
     ));
     // the connection itself is unaffected by failed operations
     assert!(handler.is_connected());
     device.set_write_behaviour(OpBehaviour::Ok);
     handler
-        .send_data(CHARAC, None, &[1], WriteType::WithResponse)
+        .send_data(CHARAC, Some(SERVICE), &[1], WriteType::WithResponse)
         .await
         .unwrap();
 }

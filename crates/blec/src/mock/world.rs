@@ -1,7 +1,7 @@
 //! The simulated radio environment and the control API used by tests and apps.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,7 +37,12 @@ pub(super) struct WorldInner {
     pub(super) events: broadcast::Sender<CentralEvent>,
     pub(super) devices: Mutex<Vec<Arc<DeviceInner>>>,
     pub(super) scanning: AtomicBool,
+    /// How often `start_scan` succeeded, see [`MockWorld::scan_starts`].
+    pub(super) scan_starts: AtomicUsize,
     pub(super) adapter_state: Mutex<CentralState>,
+    /// Whether `add_peripheral` builds a peripheral from its id, see
+    /// [`MockWorld::set_add_peripheral_supported`].
+    pub(super) add_peripheral: AtomicBool,
 }
 
 impl Default for MockWorld {
@@ -56,7 +61,9 @@ impl MockWorld {
                 events,
                 devices: Mutex::new(vec![]),
                 scanning: AtomicBool::new(false),
+                scan_starts: AtomicUsize::new(0),
                 adapter_state: Mutex::new(CentralState::PoweredOn),
+                add_peripheral: AtomicBool::new(false),
             }),
         }
     }
@@ -116,6 +123,19 @@ impl MockWorld {
         self.emit(CentralEvent::StateUpdate(state));
     }
 
+    /// Whether the adapter's `add_peripheral` hands out a peripheral for an id
+    /// without a scan having seen it (default false: `NotSupported`, like
+    /// BlueZ, CoreBluetooth and the android backend). With `true` it behaves
+    /// like WinRT and returns any device of the world, advertising or not; a
+    /// `connect()` then succeeds as long as the device is in range. Unlike
+    /// WinRT, which makes a peripheral for any address, an id no device of the
+    /// world has gives `DeviceNotFound`.
+    pub fn set_add_peripheral_supported(&self, supported: bool) {
+        self.inner
+            .add_peripheral
+            .store(supported, Ordering::Release);
+    }
+
     #[must_use]
     pub fn adapter_state(&self) -> CentralState {
         self.inner.adapter_state.lock().unwrap().clone()
@@ -132,32 +152,49 @@ impl MockWorld {
         self.inner.scanning.load(Ordering::Acquire)
     }
 
+    /// How many scans were started on the adapter so far (for assertions).
+    #[must_use]
+    pub fn scan_starts(&self) -> usize {
+        self.inner.scan_starts.load(Ordering::Acquire)
+    }
+
     /// Subscribes to the events the adapter emits (for assertions).
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<CentralEvent> {
         self.inner.events.subscribe()
     }
 
+    /// The devices a scan sees: in range and advertising.
     pub(super) fn in_range_devices(&self) -> Vec<Peripheral> {
         self.inner
             .devices
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| d.in_range.load(Ordering::Acquire))
+            .filter(|d| d.is_in_range() && d.is_advertising())
             .cloned()
             .map(Peripheral::new)
             .collect()
     }
 
-    /// Every device in the world, in range or not and known or not: the
-    /// system wide record a retrieval by identifier draws from.
+    /// The running scan receives the advertisements of the devices it sees:
+    /// the backend has a record of each of them (again).
+    pub(super) fn sight_devices(&self) {
+        for peripheral in self.in_range_devices() {
+            peripheral.inner().sighted();
+        }
+    }
+
+    /// Every device the backend has a record of, in range or not and known
+    /// or not: the system wide record a retrieval by identifier draws from.
+    /// An expired device (see [`DeviceHandle::expire`]) is not part of it.
     pub(super) fn all_devices(&self) -> Vec<Peripheral> {
         self.inner
             .devices
             .lock()
             .unwrap()
             .iter()
+            .filter(|d| !d.is_expired())
             .cloned()
             .map(Peripheral::new)
             .collect()
@@ -417,9 +454,14 @@ pub(super) struct DeviceInner {
     pub(super) gatt: BTreeSet<Service>,
     events: broadcast::Sender<CentralEvent>,
     pub(super) in_range: AtomicBool,
+    /// Whether the device advertises, see [`DeviceHandle::set_advertising`].
+    pub(super) advertising: AtomicBool,
     /// Whether the backend still has a record of this peripheral. Only a known
     /// peripheral can be connected; see [`DeviceHandle::forget`].
     pub(super) known: AtomicBool,
+    /// Whether the backend dropped the device entirely, see
+    /// [`DeviceHandle::expire`].
+    pub(super) expired: AtomicBool,
     pub(super) connected: AtomicBool,
     pub(super) discovered: AtomicBool,
     /// Characteristic values keyed by (service, characteristic)
@@ -439,7 +481,9 @@ impl DeviceInner {
             spec,
             events,
             in_range: AtomicBool::new(true),
+            advertising: AtomicBool::new(true),
             known: AtomicBool::new(true),
+            expired: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             discovered: AtomicBool::new(false),
             values: Mutex::new(HashMap::new()),
@@ -462,12 +506,27 @@ impl DeviceInner {
         self.in_range.load(Ordering::Acquire)
     }
 
+    pub(super) fn is_advertising(&self) -> bool {
+        self.advertising.load(Ordering::Acquire)
+    }
+
     pub(super) fn is_known(&self) -> bool {
         self.known.load(Ordering::Acquire)
     }
 
     pub(super) fn set_known(&self, known: bool) {
         self.known.store(known, Ordering::Release);
+    }
+
+    pub(super) fn is_expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
+    }
+
+    /// An advertisement arrived, or the backend made the peripheral from its
+    /// id: it has a record of the device again.
+    pub(super) fn sighted(&self) {
+        self.expired.store(false, Ordering::Release);
+        self.set_known(true);
     }
 
     pub(super) fn record(&self, op: Op) {
@@ -582,6 +641,21 @@ impl DeviceHandle {
         self.0.is_in_range()
     }
 
+    /// A device that stops advertising (default: advertising) no longer shows
+    /// up in scans or `peripherals()` but stays connectable while in range,
+    /// like one the OS still holds a link to or that only accepts connections
+    /// from bonded centrals. Only a handle the handler already has, a
+    /// retrieval or `add_peripheral` (see
+    /// [`MockWorld::set_add_peripheral_supported`]) reach it then.
+    pub fn set_advertising(&self, advertising: bool) {
+        self.0.advertising.store(advertising, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_advertising(&self) -> bool {
+        self.0.is_advertising()
+    }
+
     /// The backend forgets its record of the peripheral: it stays in range and
     /// keeps showing up in `peripherals()`, but `connect()` fails until it is
     /// retrieved (`retrieve_peripherals`) or a scan finds it again. This is how
@@ -594,6 +668,22 @@ impl DeviceHandle {
     #[must_use]
     pub fn is_known(&self) -> bool {
         self.0.is_known()
+    }
+
+    /// The backend drops the device entirely, the way BlueZ removes an unpaired
+    /// device it has not seen for a few minutes: unlike after [`Self::forget`]
+    /// it is gone from `peripherals()` and `retrieve_peripherals` finds nothing
+    /// for its id, and `connect()` on a handle from before fails. Only a running
+    /// scan that sees it (in range and advertising) brings it back.
+    pub fn expire(&self) {
+        self.0.expired.store(true, Ordering::Release);
+        self.0.set_known(false);
+    }
+
+    /// Whether the backend dropped the device, see [`Self::expire`].
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.0.is_expired()
     }
 
     /// Whether losing the link makes the backend [`Self::forget`] the

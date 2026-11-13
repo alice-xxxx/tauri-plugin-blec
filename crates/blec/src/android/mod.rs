@@ -20,7 +20,8 @@ use btleplug::{
 use futures::{Stream, StreamExt};
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 use std::{
@@ -80,10 +81,28 @@ pub(crate) async fn check_permissions(ask_if_denied: bool) -> std::result::Resul
     Ok(res.result)
 }
 
+/// Shows the system dialog asking the user to turn Bluetooth on, unless it is on already.
+pub(crate) async fn enable_bluetooth() -> std::result::Result<(), Error> {
+    bridge::call(
+        "enable_bluetooth",
+        serde_json::Value::Null,
+        IPC_DEFAULT_TIMEOUT,
+    )
+    .await
+}
+
 #[derive(Debug, Clone)]
 pub struct Adapter;
-static DEVICES: Lazy<RwLock<HashMap<PeripheralId, Peripheral>>> =
+/// The peripherals by id, with the [`CURRENT_SCAN`] that last reported them (`None` for one
+/// only retrieved by address).
+///
+/// A scan start keeps the entries: a connect right after it resolves its device here. Only the
+/// current scan's devices are reported as its results.
+#[allow(clippy::type_complexity)]
+static DEVICES: Lazy<RwLock<HashMap<PeripheralId, (Peripheral, Option<u64>)>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+static CURRENT_SCAN: AtomicU64 = AtomicU64::new(0);
 
 /// The services discovered per peripheral.
 ///
@@ -198,7 +217,7 @@ impl btleplug::api::Central for Adapter {
         )
         .await
         .map_err(ble_err)?;
-        DEVICES.write().await.clear();
+        let scan = CURRENT_SCAN.fetch_add(1, Ordering::Relaxed) + 1;
         let task = tokio::spawn(async move {
             while let Some(value) = rx.next().await {
                 let mut device = match serde_json::from_value::<PeripheralResult>(value) {
@@ -211,11 +230,11 @@ impl btleplug::api::Central for Adapter {
                 tracing::trace!("device: {device:?}");
                 let mut devices = DEVICES.write().await;
                 if device.name.trim().is_empty() {
-                    if let Some(known) = devices.get(&device.id) {
+                    if let Some((known, _)) = devices.get(&device.id) {
                         device.name.clone_from(&known.name);
                     }
                 }
-                devices.insert(device.id.clone(), device);
+                devices.insert(device.id.clone(), (device, Some(scan)));
             }
         });
         // A scan that is still running keeps its own channel registered; replace
@@ -245,7 +264,14 @@ impl btleplug::api::Central for Adapter {
     }
 
     async fn peripherals(&self) -> Result<Vec<Self::Peripheral>> {
-        Ok(DEVICES.read().await.values().cloned().collect())
+        let current = CURRENT_SCAN.load(Ordering::Relaxed);
+        Ok(DEVICES
+            .read()
+            .await
+            .values()
+            .filter(|(_, scan)| *scan == Some(current))
+            .map(|(device, _)| device.clone())
+            .collect())
     }
 
     /// Resolves known addresses without a scan, so a peripheral that was lost
@@ -287,11 +313,13 @@ impl btleplug::api::Central for Adapter {
     }
 
     async fn peripheral(&self, id: &PeripheralId) -> Result<Self::Peripheral> {
+        // not age-filtered: this resolves a device to act on, which can happen long after its
+        // last advertisement
         DEVICES
             .read()
             .await
             .get(id)
-            .cloned()
+            .map(|(device, _)| device.clone())
             .ok_or(btleplug::Error::DeviceNotFound)
     }
 
@@ -378,8 +406,10 @@ pub struct Peripheral {
     address: BDAddr,
     name: String,
     rssi: Option<i16>,
-    #[serde(default = "default_mtu")]
-    mtu_val: AtomicU16,
+    // Shared by every clone: `connect` stores the negotiated MTU on the
+    // instance it runs on, while callers may hold a clone taken earlier.
+    #[serde(skip_deserializing, default = "default_mtu")]
+    mtu_val: Arc<AtomicU16>,
     #[serde(default, deserialize_with = "deserialize_base64_map")]
     manufacturer_data: HashMap<u16, Vec<u8>>,
     #[serde(default, deserialize_with = "deserialize_base64_map")]
@@ -388,21 +418,22 @@ pub struct Peripheral {
     services: Vec<Uuid>,
     tx_power_level: Option<i16>,
 }
-fn default_mtu() -> AtomicU16 {
-    AtomicU16::new(23)
+fn default_mtu() -> Arc<AtomicU16> {
+    Arc::new(AtomicU16::new(23))
 }
 
 impl Peripheral {
     // Keep advertisement data and negotiated MTU when registering a system device.
-    fn register(self, devices: &mut HashMap<PeripheralId, Self>) -> Self {
+    fn register(self, devices: &mut HashMap<PeripheralId, (Self, Option<u64>)>) -> Self {
         devices
             .entry(self.id.clone())
-            .and_modify(|known| {
+            .and_modify(|(known, _)| {
                 if known.name.trim().is_empty() {
                     known.name.clone_from(&self.name);
                 }
             })
-            .or_insert(self)
+            .or_insert((self, None))
+            .0
             .clone()
     }
 }
@@ -414,7 +445,7 @@ impl Clone for Peripheral {
             address: self.address,
             name: self.name.clone(),
             rssi: self.rssi,
-            mtu_val: AtomicU16::new(self.mtu_val.load(Ordering::Relaxed)),
+            mtu_val: self.mtu_val.clone(),
             manufacturer_data: self.manufacturer_data.clone(),
             service_data: self.service_data.clone(),
             services: self.services.clone(),

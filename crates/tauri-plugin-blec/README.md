@@ -26,7 +26,7 @@ Or manually add it to the `src-tauri/Cargo.toml`
 
 ```toml
 [dependencies]
-tauri-plugin-blec = "0.18.0" # x-release-please-version
+tauri-plugin-blec = "0.20.0" # x-release-please-version
 ```
 
 ### Install the js bindings
@@ -81,6 +81,7 @@ requirement.
 
 Call `checkPermissions(true)` from the frontend (or `blec::check_permissions(true)` from rust)
 before scanning; it asks the user and, if they denied before, sends them to the app settings.
+`enableBluetooth()` (`blec::enable_bluetooth()`) asks the user to turn Bluetooth on.
 
 ### IOS Setup
 
@@ -132,6 +133,10 @@ await connect(address, () => console.log('disconnected'))
 const CHARACTERISTIC_UUID = '51FF12BB-3ED8-46E5-B4F9-D64E2FEC021B'
 await sendString(CHARACTERISTIC_UUID, 'Test', 'withResponse')
 ```
+
+The service UUID is the optional last parameter. Pass it when the device has the characteristic
+UUID in more than one service; without it, the call fails because the characteristic is
+ambiguous. See [blec's README](../blec/README.md#usage) for what is not supported yet.
 
 With several devices, use the `BleConnection` that `connect` returns (or `connection(address)`
 for a device that is connected already):
@@ -212,7 +217,7 @@ const DATA: [u8; 500] = [0; 500];
 let handler = tauri_plugin_blec::get_handler().unwrap();
 handler
     // `None` searches every service for the characteristic; pass `Some(uuid)`
-    // when two services share one.
+    // when two services share one, otherwise this fails as ambiguous.
     .send_data(CHARACTERISTIC_UUID, None, &DATA, WriteType::WithResponse)
     .await
     .unwrap();

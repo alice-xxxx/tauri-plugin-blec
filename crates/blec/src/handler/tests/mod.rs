@@ -5,7 +5,10 @@
 mod connect;
 mod disconnect;
 mod helpers;
+mod lookup;
 mod multi;
 mod notify;
+mod runtime;
 mod scan;
+mod scan_connect;
 mod stress;
